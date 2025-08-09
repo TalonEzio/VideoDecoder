@@ -2,7 +2,7 @@
   "profiles": {
     "VideoDecoder": {
       "commandName": "Project",
-      "commandLineArgs": "-i \"C:\\Users\\Talon Ezio\\Downloads\\Video\\3.vlxx\" -o \"C:\\Users\\Talon Ezio\\Downloads\\Video\\3.mkv\""
+      "commandLineArgs": "-i \"C:\\Users\\Talon Ezio\\Downloads\\videoplayback.vl\" -o \"C:\\Users\\Talon Ezio\\Downloads\\Video\\nm2.mkv\""
     }
   }
 }

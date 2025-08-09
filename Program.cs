@@ -3,9 +3,9 @@ using System.Text;
 using FFMpegCore;
 using Polly;
 using Polly.Extensions.Http;
+using System.Buffers;
 
 namespace VideoDecoder;
-
 
 public class Options
 {
@@ -13,90 +13,93 @@ public class Options
     public string InputM3U8File { get; set; } = string.Empty;
     public string OutputVideoFile { get; set; } = string.Empty;
     public string VideoCodec { get; set; } = "h264_nvenc";
-    public int TaskCount { get; set; } = 1;
+    public int TaskCount { get; set; } = 4;
 }
 
 internal class Program
 {
-    private static readonly byte[] IendChunk = "IEND"u8.ToArray();
-
+    // 8 byte: length=0 (00 00 00 00) + "IEND"
+    private static readonly byte[] IendLenType = "\0\0\0\0IEND"u8.ToArray();
     private static long _totalBytes;
+
+    private static readonly HttpClientHandler HttpHandler = new()
+    {
+        //dev only!
+        ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+    };
+
+    private static readonly HttpClient Http = new(HttpHandler)
+    {
+        Timeout = TimeSpan.FromSeconds(100)
+    };
+
+    private static readonly IAsyncPolicy<HttpResponseMessage> RetryPolicy =
+        HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                onRetry: (_, _, attempt, _) => Console.WriteLine($"Retrying... Attempt {attempt}")
+            );
 
     private static async Task Main(string[] args)
     {
         Console.InputEncoding = Console.OutputEncoding = Encoding.Unicode;
         var options = ParseArguments(args);
 
-        Console.InputEncoding = Console.OutputEncoding = Encoding.Unicode;
-        Console.WriteLine("Cần ffmpeg trong Environment, chưa có thì tải");
+        Console.WriteLine("Cần ffmpeg trong Environment, chưa có thì tải.");
         var tempDir = Path.Combine(AppContext.BaseDirectory, "Temp");
 
         if (Directory.Exists(tempDir))
         {
             foreach (var fileInfo in new DirectoryInfo(tempDir).GetFiles())
-            {
                 fileInfo.Delete();
-            }
         }
         else
         {
             Directory.CreateDirectory(tempDir);
         }
 
-        string m3U8FilePath = "demo.m3u8";
+        string outputM3U8FilePath = "demo.m3u8";
 
-        var stopWatch = new Stopwatch();
-        stopWatch.Start();
+        var stopWatch = Stopwatch.StartNew();
 
         if (!string.IsNullOrEmpty(options.Url))
         {
-            await DownloadFromUrl(options.Url, m3U8FilePath);
+            await DownloadFile(options.Url, outputM3U8FilePath);
         }
         else if (!string.IsNullOrEmpty(options.InputM3U8File))
         {
-            m3U8FilePath = options.InputM3U8File;
+            outputM3U8FilePath = options.InputM3U8File;
         }
 
-        var content = await File.ReadAllLinesAsync(m3U8FilePath);
+        var content = await File.ReadAllLinesAsync(outputM3U8FilePath);
+        var segmentUrls = content.Where(x => x.StartsWith("http", StringComparison.OrdinalIgnoreCase)).ToList();
 
-        var fakePngUrls = content.Where(x => x.StartsWith("http")).ToList();
+        var semaphore = new SemaphoreSlim(options.TaskCount);
+        var tasks = new List<Task>(segmentUrls.Count);
 
-        var downloadTasks = new List<Task>();
-
-        var semaphoreSlim = new SemaphoreSlim(options.TaskCount);
-
-        for (var i = 0; i < fakePngUrls.Count; i++)
+        for (int i = 0; i < segmentUrls.Count; i++)
         {
-            var fakePngUrl = fakePngUrls[i];
-
-            var pngFilePath = Path.Combine(tempDir, $"output{i:D5}.png");
-
-            downloadTasks.Add(PngToTsWrapper(fakePngUrl, pngFilePath, semaphoreSlim));
+            string url = segmentUrls[i];
+            string tsPath = Path.Combine(tempDir, $"output{i:D5}.ts");
+            tasks.Add(DownloadAndExtractTsWrapper(url, tsPath, semaphore));
         }
 
-        await Task.WhenAll(downloadTasks);
+        await Task.WhenAll(tasks);
 
-        Console.WriteLine($"Dung lượng file:{(_totalBytes / 1024.0 / 1024.0):F2} MB");
-
+        Console.WriteLine($"\nDung lượng file tải: {(_totalBytes / 1024.0 / 1024.0):F2} MB");
 
         await MergeToFinalVideo(tempDir, options);
-        stopWatch.Stop();
 
+        stopWatch.Stop();
         Console.WriteLine($"Xử lý (Download, Merge) hết: {stopWatch}");
 
         if (Directory.Exists(tempDir))
         {
             foreach (var fileInfo in new DirectoryInfo(tempDir).GetFiles())
-            {
                 fileInfo.Delete();
-            }
         }
-
-        //if (File.Exists(m3U8FilePath))
-        //{
-        //    File.Delete(m3U8FilePath);
-        //}
-
     }
 
     private static Options ParseArguments(string[] args)
@@ -116,19 +119,15 @@ internal class Program
                     {
                         options.InputM3U8File = args[i + 1];
                         if (!File.Exists(options.InputM3U8File))
-                        {
                             throw new FileNotFoundException("Không tìm thấy file");
-                        }
                     }
                     break;
                 case "-u":
                     if (i + 1 < args.Length)
                     {
                         options.Url = args[i + 1];
-                        if (!options.Url.StartsWith("http"))
-                        {
+                        if (!options.Url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                             throw new ArgumentException("Url không đúng định dạng");
-                        }
                     }
                     break;
                 case "-o":
@@ -137,19 +136,16 @@ internal class Program
                         options.OutputVideoFile = args[i + 1];
                         var directoryInfo = new FileInfo(options.OutputVideoFile).Directory;
                         if (directoryInfo is { Exists: false })
-                        {
                             throw new ArgumentException("Không thấy thư mục");
-                        }
                     }
                     break;
                 case "-c":
-                    if (i + 1 < args.Length && args[i + 1].Length > 5) options.VideoCodec = args[i + 1];
+                    if (i + 1 < args.Length && args[i + 1].Length > 5)
+                        options.VideoCodec = args[i + 1];
                     break;
                 case "-t":
                     if (i + 1 < args.Length && int.TryParse(args[i + 1], out var taskCount))
-                    {
-                        options.TaskCount = taskCount;
-                    }
+                        options.TaskCount = Math.Max(1, taskCount);
                     break;
             }
         }
@@ -164,73 +160,22 @@ internal class Program
         Console.WriteLine("  -i <file>        Đường dẫn đến tệp M3U8 đầu vào");
         Console.WriteLine("  -u <url>         URL để tải xuống tệp M3U8");
         Console.WriteLine("  -o <file>        Đường dẫn đến tệp video đầu ra");
-        Console.WriteLine("  -c <codec>       Bộ mã hóa video, ví dụ: h264_nvenc (mặc định)");
-        Console.WriteLine("  -t <count>       Số lượng tác vụ tải xuống đồng thời (mặc định: 10)");
+        Console.WriteLine("  -c <codec>       Bộ mã hóa video khi fallback, ví dụ: h264_nvenc (mặc định)");
+        Console.WriteLine("  -t <count>       Số lượng tác vụ tải xuống đồng thời (mặc định: 4)");
         Console.WriteLine("\nExample:");
         Console.WriteLine("  VideoDecoder -u <url> -o output.mp4 -c h264_nvenc -t 5");
     }
 
-    private static async Task MergeToFinalVideo(string inputDirectory, Options inputOptions)
-    {
-        var tsFiles = Directory.GetFiles(inputDirectory, "*.ts").OrderBy(x => x).ToList();
+    // ===========================
+    // Download + Extract (stream)
+    // ===========================
 
-        var fileLines = tsFiles.Select(file => $"file '{file.Replace('\\', '/')}").ToList();
-
-        var tempFile = Path.Combine(Path.GetTempPath(), Path.GetTempFileName());
-
-        try
-        {
-            await File.WriteAllLinesAsync(tempFile, fileLines);
-
-            var ffmpegProcess = FFMpegArguments
-                .FromFileInput(tempFile, true, options => { options.WithCustomArgument("-f concat -safe 0"); })
-                .OutputToFile(inputOptions.OutputVideoFile, true, options =>
-                {
-                    options.WithCustomArgument($"-c:v {inputOptions.VideoCodec}"); // h264_nvenc -> livxh264 if u don't have nvidia gpu
-                });
-
-
-
-            Console.WriteLine($"Arguments: {ffmpegProcess.Arguments}");
-
-
-            ffmpegProcess.NotifyOnProgress((percent) =>
-            {
-                Console.Write($"\rTrạng thái: {percent / 10000}%");
-            }, TimeSpan.FromSeconds(1));
-
-
-            await ffmpegProcess.ProcessAsynchronously();
-
-            Console.WriteLine("Gộp ts thành file video hoàn tất!");
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e);
-        }
-
-        foreach (var tsFile in tsFiles)
-        {
-            File.Delete(tsFile);
-        }
-
-        if (File.Exists(tempFile))
-        {
-            File.Delete(tempFile);
-        }
-
-    }
-
-    private static async Task PngToTsWrapper(string url, string outputPath, SemaphoreSlim semaphoreSlim)
+    private static async Task DownloadAndExtractTsWrapper(string url, string tsOutputPath, SemaphoreSlim semaphore)
     {
         try
         {
-            await semaphoreSlim.WaitAsync();
-            await DownloadFromUrl(url, outputPath);
-
-            var tsFilePath = Path.ChangeExtension(outputPath, "ts");
-
-            await ConvertPngToTs(outputPath, tsFilePath);
+            await semaphore.WaitAsync();
+            await DownloadAndExtractTsAsync(url, tsOutputPath);
         }
         catch (Exception e)
         {
@@ -238,102 +183,191 @@ internal class Program
         }
         finally
         {
-            semaphoreSlim.Release();
+            semaphore.Release();
         }
     }
 
-    private static async Task DownloadFromUrl(string url, string outputFilePath)
+    private static async Task DownloadAndExtractTsAsync(string url, string tsOutputPath, int bufferSize = 64 * 1024)
     {
-        var handler = new HttpClientHandler
+        using var resp = await RetryPolicy.ExecuteAsync(() =>
+            Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead));
+
+        if (!resp.IsSuccessStatusCode)
         {
-            ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
-        };
+            Console.WriteLine($"Request failed with status code: {resp.StatusCode}");
+            resp.EnsureSuccessStatusCode();
+        }
 
-        var retryPolicy = HttpPolicyExtensions
-            .HandleTransientHttpError()
-            .WaitAndRetryAsync(
-                retryCount: 3, // Số lần retry
-                sleepDurationProvider: retryAttempt =>
-                    TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), // Thời gian chờ tăng dần
-                onRetry: (outcome, timespan, retryAttempt, context) =>
+        if (resp.Content.Headers.ContentLength.HasValue)
+            Interlocked.Add(ref _totalBytes, resp.Content.Headers.ContentLength.Value);
+
+        await using var inStream = await resp.Content.ReadAsStreamAsync();
+        await using var outStream = new FileStream(tsOutputPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, useAsync: true);
+
+        await ExtractTsFromPngStreamAsync(inStream, outStream, bufferSize);
+        Console.WriteLine($"Đã lưu segment: {Path.GetFileName(tsOutputPath)}");
+    }
+
+    /// <summary>
+    /// Đọc stream PNG theo block, tìm mẫu 8 byte (00 00 00 00 'I' 'E' 'N' 'D'), bỏ 4 byte CRC, rồi ghi phần còn lại sang TS.
+    /// Không giữ nguyên file PNG, không load toàn bộ vào RAM.
+    /// </summary>
+    private static async Task ExtractTsFromPngStreamAsync(Stream input, Stream tsOutput, int bufferSize)
+    {
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
+        {
+            int matched = 0;
+            int skipCrc = 0;
+            bool writing = false;
+
+            while (true)
+            {
+                int read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length));
+                if (read == 0) break;
+
+                int idx = 0;
+
+                if (!writing)
                 {
-                    Console.WriteLine($"Retrying... Attempt {retryAttempt}");
-                });
+                    while (idx < read && !writing)
+                    {
+                        byte b = buffer[idx];
 
-        var httpClient = new HttpClient(handler);
+                        if (matched < IendLenType.Length)
+                        {
+                            if (b == IendLenType[matched])
+                            {
+                                matched++;
+                            }
+                            else
+                            {
+                                matched = (b == IendLenType[0]) ? 1 : 0;
+                            }
+                            idx++;
+
+                            if (matched == IendLenType.Length)
+                            {
+                                skipCrc = 4;
+                            }
+                        }
+                        else if (skipCrc > 0)
+                        {
+                            int canSkip = Math.Min(skipCrc, read - idx);
+                            skipCrc -= canSkip;
+                            idx += canSkip;
+
+                            if (skipCrc == 0)
+                            {
+                                writing = true;
+                                if (idx < read)
+                                {
+                                    await tsOutput.WriteAsync(buffer.AsMemory(idx, read - idx));
+                                    idx = read;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    await tsOutput.WriteAsync(buffer.AsMemory(0, read));
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+    private static async Task MergeToFinalVideo(string inputDirectory, Options inputOptions)
+    {
+        var tsFiles = Directory.GetFiles(inputDirectory, "*.ts").OrderBy(x => x).ToList();
+        if (tsFiles.Count == 0)
+        {
+            Console.WriteLine("Không có file .ts để gộp.");
+            return;
+        }
+
+        var fileLines = tsFiles.Select(file => $"file '{file.Replace('\\', '/')}'").ToList();
+        var tempList = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".txt");
 
         try
         {
-            var response = await retryPolicy.ExecuteAsync(() => httpClient.GetAsync(url));
+            await File.WriteAllLinesAsync(tempList, fileLines, new UTF8Encoding(false));
 
-#if DEBUG
-            Console.WriteLine(response.IsSuccessStatusCode
-                ? $"Success download {url}"
-                : $"Request failed with status code: {response.StatusCode}");
-#endif
+            var copyProc = FFMpegArguments
+                .FromFileInput(tempList, true, o => o.WithCustomArgument("-f concat -safe 0"))
+                .OutputToFile(inputOptions.OutputVideoFile, true, o =>
+                {
+                    o.WithCustomArgument("-c copy -map 0 -max_interleave_delta 0");
+                    if (Path.GetExtension(inputOptions.OutputVideoFile).Equals(".mp4", StringComparison.OrdinalIgnoreCase))
+                        o.WithCustomArgument("-bsf:a aac_adtstoasc -movflags +faststart");
+                });
 
-            if (response.Content.Headers.ContentLength.HasValue)
+            Console.WriteLine($"Arguments (try copy): {copyProc.Arguments}");
+            copyProc.NotifyOnProgress(p => Console.Write($"\rTrạng thái (copy): {p / 10000}%"), TimeSpan.FromSeconds(1));
+
+            try
             {
-                Interlocked.Add(ref _totalBytes, response.Content.Headers.ContentLength.Value);
-
+                await copyProc.ProcessAsynchronously();
+                Console.WriteLine("\nGộp (copy) hoàn tất!");
             }
-            var localFileStream = new FileStream(outputFilePath, FileMode.OpenOrCreate, FileAccess.Write);
+            catch (Exception exCopy)
+            {
+                Console.WriteLine($"\nCopy fail, fallback re-encode: {exCopy.Message}");
 
-            var httpFileStream = await response.Content.ReadAsStreamAsync();
+                var reencProc = FFMpegArguments
+                    .FromFileInput(tempList, true, o => o.WithCustomArgument("-f concat -safe 0"))
+                    .OutputToFile(inputOptions.OutputVideoFile, true, o =>
+                    {
+                        o.WithCustomArgument($"-c:v {inputOptions.VideoCodec} -c:a copy -movflags +faststart -map 0");
+                        o.WithCustomArgument("-preset p1");
+                    });
 
-            await httpFileStream.CopyToAsync(localFileStream);
+                Console.WriteLine($"Arguments (re-encode): {reencProc.Arguments}");
+                reencProc.NotifyOnProgress(p => Console.Write($"\rTrạng thái (re-encode): {p / 10000}%"), TimeSpan.FromSeconds(1));
+                await reencProc.ProcessAsynchronously();
 
-            await localFileStream.DisposeAsync();
+                Console.WriteLine("\nGộp (re-encode) hoàn tất!");
+            }
         }
-        catch (Exception ex)
+        catch (Exception e)
         {
-            Console.WriteLine($"Request failed: {ex.Message}");
+            Console.WriteLine(e);
+        }
+        finally
+        {
+            foreach (var tsFile in tsFiles)
+            {
+                try { File.Delete(tsFile); } catch { /* ignore */ }
+            }
+
+            if (File.Exists(tempList))
+            {
+                try { File.Delete(tempList); } catch { /* ignore */ }
+            }
         }
     }
 
+    // ===========================
+    // Download helper (M3U8 file)
+    // ===========================
 
-    private static async Task ConvertPngToTs(string pngFilePath, string outputTsFilePath)
+    private static async Task DownloadFile(string url, string outputFilePath)
     {
-        var pngData = await File.ReadAllBytesAsync(pngFilePath);
-
-        var iendIndex = FindChunk(pngData, IendChunk);
-
-        if (iendIndex != -1)
+        using var resp = await RetryPolicy.ExecuteAsync(() => Http.GetAsync(url));
+        if (!resp.IsSuccessStatusCode)
         {
-            //end of png file: "IEND" string: 4 bytes + Chunk Type: 4 bytes + CRC: 4 bytes = 12 bytes
-            //https://www.w3.org/TR/PNG-Rationale.html#R.Chunk-layout
-            var tsDataStartIndex = iendIndex + 12;
-
-            if (tsDataStartIndex < pngData.Length)
-            {
-                var tsData = new byte[pngData.Length - tsDataStartIndex];
-                Array.Copy(pngData, tsDataStartIndex, tsData, 0, tsData.Length);
-
-                await File.WriteAllBytesAsync(outputTsFilePath, tsData);
-                Console.WriteLine("Đã lưu segment: " + Path.GetFileName(outputTsFilePath));
-            }
-            else
-            {
-                Console.WriteLine("Không có dữ liệu ẩn sau chunk IEND.");
-            }
+            Console.WriteLine($"Request failed with status code: {resp.StatusCode}");
+            resp.EnsureSuccessStatusCode();
         }
-        else
-        {
-            Console.WriteLine("Không tìm thấy chunk IEND trong file PNG.");
-        }
+
+        if (resp.Content.Headers.ContentLength.HasValue)
+            Interlocked.Add(ref _totalBytes, resp.Content.Headers.ContentLength.Value);
+
+        await using var local = new FileStream(outputFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, true);
+        await using var httpStream = await resp.Content.ReadAsStreamAsync();
+        await httpStream.CopyToAsync(local);
     }
-
-    private static int FindChunk(byte[] data, byte[] chunkName)
-    {
-        for (var i = 0; i <= data.Length - chunkName.Length; i++)
-        {
-            var found = !chunkName.Where((t, j) => data[i + j] != t).Any();
-            if (found)
-            {
-                return i;
-            }
-        }
-        return -1;
-    }
-
 }
