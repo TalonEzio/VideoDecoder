@@ -2,7 +2,7 @@
   "profiles": {
     "VideoDecoder": {
       "commandName": "Project",
-      "commandLineArgs": "-i \"C:\\Users\\Talon Ezio\\Downloads\\videoplayback.vl\" -o \"C:\\Users\\Talon Ezio\\Downloads\\Video\\nm2.mkv\""
+      "commandLineArgs": "-u \"https://rr3---sn-8pxuuxa-i5ozr.qooglevideo.com/manifest-s1/02914.vl\r\n\" -o \"C:\\Users\\Talon Ezio\\Downloads\\Video\\swap.mkv\""
     }
   }
 }
